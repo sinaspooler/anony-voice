@@ -15,7 +15,30 @@ paired automatically.
   detection.
 - Pure PHP + SQLite + vanilla JS. No dependencies, no build step.
 
-## Quick start (XAMPP)
+## One-line install on a server (Ubuntu 24.04)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinaspooler/anony-voice/main/install.sh | sudo bash
+```
+
+That single command installs Apache + PHP + SQLite, deploys the code to
+`/var/www/html/voice`, prepares the writable data directory, writes the Apache
+site (with the database directory locked away from the web), configures the
+firewall if `ufw` is active, and starts serving.
+
+**Recommended — with your domain** (enables HTTPS, which browsers require for
+microphone access; point an `A` record at the server first):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sinaspooler/anony-voice/main/install.sh | sudo bash -s -- --domain voice.example.com
+```
+
+Extras: `--repo <url>` to install a fork, `--dir <path>` for another location,
+`--no-https` to skip certbot, `--help` for all options. The installer is safe
+to re-run. Full step-by-step instructions and troubleshooting live in
+[UBUNTU-INSTALL.md](UBUNTU-INSTALL.md).
+
+## Quick start (XAMPP, Windows)
 
 1. This folder lives in `htdocs\voice`, so with Apache running open:
    **http://localhost/voice/**
@@ -76,9 +99,11 @@ nothing worth wiping).
 
 | File | Purpose |
 |---|---|
+| `install.sh` | One-line server installer for Ubuntu 24.04 (packages, deploy, Apache, firewall, HTTPS) |
 | `index.html` | Single-page UI: start / waiting / call / ended screens + chat panel |
 | `style.css` | Dark theme, radar waiting animation, mic-level rings, chat styling |
 | `app.js` | WebRTC, polling client, matchmaking flow, chat, audio meters |
 | `heartbeat.js` | Web Worker keep-alive so background tabs aren't dropped mid-call |
 | `api.php` | Matchmaking + signaling + chat API over SQLite |
+| `UBUNTU-INSTALL.md` | Full Ubuntu 24.04 server manual (manual steps, HTTPS, troubleshooting) |
 | `data/` | Auto-created SQLite database (web access blocked) |

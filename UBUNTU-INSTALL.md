@@ -12,6 +12,25 @@ the standard Ubuntu repositories, no Composer, npm or databases to install.
 
 ---
 
+## Fast path: the one-line installer
+
+Everything in steps 2–6 (and optionally 7) is automated by the bundled
+installer — safe to re-run, works on a fresh Ubuntu 24.04 box:
+
+```bash
+# HTTP-only (add HTTPS afterwards with step 7)
+curl -fsSL https://raw.githubusercontent.com/sinaspooler/anony-voice/main/install.sh | sudo bash
+
+# with HTTPS in one go (domain must already point at this server)
+curl -fsSL https://raw.githubusercontent.com/sinaspooler/anony-voice/main/install.sh | sudo bash -s -- --domain voice.example.com
+```
+
+The rest of this guide documents what the installer does, step by step, plus
+testing and troubleshooting — read on if you want manual control or need to
+debug.
+
+---
+
 ## 1. Prerequisites
 
 - A Ubuntu 24.04 server with a user that has `sudo`.
