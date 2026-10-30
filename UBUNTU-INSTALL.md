@@ -40,7 +40,7 @@ Both `pdo_sqlite` and `sqlite3` ship enabled by default; if a line is missing,
 ## 3. Deploy the code
 
 ```bash
-sudo git clone https://github.com/YOUR-USERNAME/anony-voice.git /var/www/html/voice
+sudo git clone https://github.com/sinaspooler/anony-voice.git /var/www/html/voice
 ```
 
 (Or upload the files with `scp`/`rsync` if you prefer — the layout must end up
