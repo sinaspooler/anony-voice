@@ -1,0 +1,9 @@
+# runtime database (created and managed by api.php)
+data/voice.db
+data/voice.db-wal
+data/voice.db-shm
+
+# session/workspace noise
+.zcode/
+Thumbs.db
+.DS_Store

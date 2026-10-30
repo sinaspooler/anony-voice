@@ -1,0 +1,2 @@
+# VoiceLoop's SQLite database must never be served.
+Require all denied

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="Talk live with a random stranger. No accounts, no names — just voices.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'">
+<title>VoiceLoop — talk to a stranger</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+</head>
+<body>
+<main id="app">
+
+  <!-- START -->
+  <section id="screen-start" class="screen">
+    <div class="logo">🎙️</div>
+    <h1>VoiceLoop</h1>
+    <p class="tagline">Talk live with a random stranger.<br>No accounts. No names. Just voices.</p>
+    <button id="btn-start" class="btn-primary">Start talking</button>
+    <p class="privacy">Peer-to-peer audio &middot; nothing is recorded &middot; the server only introduces you</p>
+    <p id="start-error" class="error hidden"></p>
+  </section>
+
+  <!-- WAITING -->
+  <section id="screen-waiting" class="screen hidden">
+    <div class="radar">
+      <span></span><span></span><span></span>
+      <div class="radar-core">🎙️</div>
+    </div>
+    <h2>Looking for a stranger&hellip;</h2>
+    <p class="muted">Stay here — you'll be connected the moment someone else starts.</p>
+    <button id="btn-cancel" class="btn-ghost">Cancel</button>
+  </section>
+
+  <!-- CALL -->
+  <section id="screen-call" class="screen hidden">
+    <div class="peers">
+      <div class="peer">
+        <div class="avatar" id="ring-local"><span class="emoji">🙂</span></div>
+        <div class="peer-name">You</div>
+      </div>
+      <div class="call-mid">
+        <div id="call-status">Connecting&hellip;</div>
+        <div class="timer" id="call-timer">00:00</div>
+      </div>
+      <div class="peer">
+        <div class="avatar remote" id="ring-remote"><span class="emoji">🎭</span></div>
+        <div class="peer-name">Stranger</div>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="btn-chat" class="btn-round" title="Text chat" aria-label="Open text chat">💬<span class="unread-dot hidden"></span></button>
+      <button id="btn-mute" class="btn-round" title="Mute microphone" aria-label="Mute microphone">🎙️</button>
+      <button id="btn-end" class="btn-round danger" title="End call" aria-label="End call">📵</button>
+    </div>
+  </section>
+
+  <!-- ENDED -->
+  <section id="screen-ended" class="screen hidden">
+    <div class="logo small">👋</div>
+    <h2 id="ended-title">Call ended</h2>
+    <p class="muted" id="ended-sub">The call is over.</p>
+    <button id="btn-again" class="btn-primary">Find another stranger</button>
+    <button id="btn-home" class="btn-ghost">Back to start</button>
+  </section>
+
+  <!-- TEXT CHAT -->
+  <aside id="chat-panel" class="hidden" aria-label="Text chat">
+    <header>
+      <span>Stranger</span>
+      <button id="btn-chat-close" aria-label="Close chat">&times;</button>
+    </header>
+    <div id="chat-log"></div>
+    <form id="chat-form">
+      <input id="chat-input" maxlength="2000" placeholder="Type a message&hellip;" autocomplete="off">
+      <button type="submit" aria-label="Send message">➤</button>
+    </form>
+  </aside>
+
+</main>
+
+<!-- remote audio: kept visually hidden but rendered so playback stays allowed -->
+<audio id="remote-audio" autoplay playsinline></audio>
+
+<script src="app.js"></script>
+</body>
+</html>
