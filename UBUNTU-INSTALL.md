@@ -42,7 +42,7 @@ debug.
 
 ```bash
 sudo apt update && sudo apt -y upgrade
-sudo apt -y install apache2 libapache2-mod-php php php-sqlite3 git
+sudo apt -y install apache2 libapache2-mod-php php php-sqlite3 git nodejs npm ffmpeg
 ```
 
 Verify:
@@ -51,6 +51,8 @@ Verify:
 php -v          # expect PHP 8.3.x
 php -m | grep -i 'pdo_sqlite\|sqlite3'   # both lines must appear
 apache2 -v      # expect Apache/2.4.x (Ubuntu)
+node -v         # expect v18+ (v0.2's audio service)
+ffmpeg -version # needed to mix session recordings into .ogg
 ```
 
 Both `pdo_sqlite` and `sqlite3` ship enabled by default; if a line is missing,
@@ -65,19 +67,45 @@ sudo git clone https://github.com/sinaspooler/anony-voice.git /var/www/html/voic
 (Or upload the files with `scp`/`rsync` if you prefer — the layout must end up
 as `/var/www/html/voice/index.html` etc.)
 
-## 4. Create the writable data directory
+## 4. Writable directories + the audio service (SFU)
 
-The SQLite database lives in `data/` inside the project. On Ubuntu, Apache/PHP
-run as the `www-data` user and `/var/www/html` is root-owned, so create and
-hand over the directory **before** the first request:
+v0.2 has two runtime areas and one companion service:
 
 ```bash
-sudo mkdir -p /var/www/html/voice/data
-sudo chown -R www-data:www-data /var/www/html/voice/data
+# database + recordings must be writable by PHP (www-data)
+sudo mkdir -p /var/www/html/voice/data /var/www/html/voice/sessions
+sudo chown -R www-data:www-data /var/www/html/voice/data /var/www/html/voice/sessions
+
+# install the SFU's dependencies and register it as a service
+cd /var/www/html/voice/sfu
+sudo npm ci --omit=dev || sudo npm install --omit=dev
+
+sudo tee /etc/systemd/system/voice-sfu.service > /dev/null <<'EOF'
+[Unit]
+Description=VoiceLoop audio SFU (WebRTC forwarding + recording)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/html/voice/sfu
+ExecStart=/usr/bin/node /var/www/html/voice/sfu/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now voice-sfu
+sleep 2
+curl -s http://127.0.0.1:3000/health     # expect {"ok":true,...}
 ```
 
-`api.php` creates `data/voice.db` automatically on first use — nothing else to
-configure.
+The SFU listens **only on 127.0.0.1** — clients never talk to it directly;
+`api.php` tunnels the WebRTC handshake to it. `config.json` (shared secret) is
+auto-generated on first run; delete it to rotate.
 
 ## 5. Apache site configuration
 
@@ -98,8 +126,14 @@ Create `/etc/apache2/sites-available/voice.conf`:
         Require all granted
     </Directory>
 
-    # never serve the SQLite database or its WAL files
+    # never serve the SQLite database, the Node service, or raw recordings
     <Directory /var/www/html/voice/data>
+        Require all denied
+    </Directory>
+    <Directory /var/www/html/voice/sfu>
+        Require all denied
+    </Directory>
+    <Directory /var/www/html/voice/sessions>
         Require all denied
     </Directory>
 
@@ -153,27 +187,30 @@ curl -I https://voice.example.com/
 
 ## 8. Test it end to end
 
-1. Open `https://voice.example.com/` in **two different browsers or devices**.
-2. Click **Start talking** on both, allow the microphone when asked.
-3. One side shows *Looking for a stranger…* until the other joins — then both
-   flip to the call screen with a running timer.
-4. Check: audio both ways, mute toggle, text chat, glowing mic rings, and
-   *Stranger left* when one side closes the tab.
+1. Open `https://voice.example.com/`, enter a nickname, click **Create a room**.
+2. Share the invite link (🔗 Invite button) and open it on **another device** —
+   join with a different nickname. Any number of people up to 15 can join.
+3. Check: participant tiles with nicknames, glowing rings around whoever is
+   speaking, mute toggle, text chat, and the red **REC** timer.
+4. The host's ⏹️ **End room** closes it for everyone; the recording link
+   appears on the ended screen and the `.ogg` lands in
+   `/var/www/html/voice/sessions/`.
 
-If you test with two windows **on the server's own desktop** (not possible on
-a headless server, but true for a home lab), plain `http://localhost` also
-works without HTTPS.
+Rooms also work between the API directly — see **API.md** (that contract is
+what an Android app would implement).
 
 ## 9. Updating the site
 
 ```bash
 cd /var/www/html/voice
 sudo git pull
-sudo systemctl reload apache2    # only needed if api.php changed
+cd sfu && sudo npm ci --omit=dev      # if sfu/package.json changed
+sudo systemctl restart voice-sfu     # pick up SFU changes
+sudo systemctl reload apache2        # only needed if api.php changed
 ```
 
-`data/` is gitignored — updates never touch the live database. To wipe all
-matchmaking state anyway:
+`data/` and `sessions/` are gitignored — updates never touch the database or
+existing recordings. To wipe room state anyway:
 
 ```bash
 sudo rm -f /var/www/html/voice/data/voice.db*
@@ -183,23 +220,24 @@ sudo rm -f /var/www/html/voice/data/voice.db*
 
 | Symptom | Cause & fix |
 |---|---|
-| Browser never asks for mic permission / "Microphone access is required" | Site is being served over plain HTTP. Complete step 7, or browse via `https://`. |
-| `500` from `api.php`, nothing in `voice-error.log` | PHP error log: `sudo tail -f /var/log/apache2/error.log`. Most common: `data/` not writable — redo step 4. |
-| "Could not reach the server" on the start screen | Apache down or PHP module missing: `systemctl status apache2`, `php -m`. |
-| Page loads but pairing never happens | Two different sites configured (e.g. visitors on `https://voice.example.com` while a friend opened `http://server-ip`). Matchmaking pairs clients that use the **same origin** — always share the exact HTTPS URL. |
-| `403 Forbidden` when opening `https://voice.example.com/data/` | **Expected** — that directory must never be web-readable. |
-| "Connection failed" after ~30 s, works on LAN but not across the internet | Both callers are behind strict (symmetric) NATs and STUN alone can't punch through. Add a TURN server to `RTC_CONFIG` at the top of `app.js`: `{ urls: 'turn:your-turn:3478', username: '...', credential: '...' }` (e.g. a self-hosted [coturn](https://github.com/coturn/coturn) or a metered provider). |
+| Browser never asks for mic permission / "Microphone unavailable" | Site is being served over plain HTTP. Complete step 7, or browse via `https://`. |
+| "Media service unavailable" on join | The SFU is down: `systemctl status voice-sfu`, `journalctl -u voice-sfu`. On a dev box: `cd sfu && node server.js`. |
+| Room works but no session `.ogg` in `sessions/` | ffmpeg missing → the session row says `format: "parts"` and parts sit in `sessions/parts/`. Install ffmpeg (step 2) — new rooms will mix automatically. |
+| `500` from `api.php` | PHP error log: `sudo tail -f /var/log/apache2/error.log`. Most common: `data/` or `sessions/` not writable — redo step 4. |
+| Page loads but joining fails with "room not found" | Different origins in play (e.g. invite copied from `http://server-ip` while the room lives on `https://voice.example.com`) — always share the exact HTTPS URL. |
+| `403 Forbidden` when opening `https://voice.example.com/data/` or `/sessions/` | **Expected** — those directories must never be web-readable; recordings download via `api.php?action=session`. |
+| Participants freeze for someone after a few minutes | A member stopped heartbeating (app in background without the heartbeat worker, or network loss). The server auto-removes silent members after ~12 s. |
+| Caller behind very strict corporate NAT can't connect | Unlike P2P designs, clients connect *outward* to your server, so most NATs work. For the rare blocking case, add a TURN server to `ICE_SERVERS` at the top of `app.js`. |
 | Calls drop when a caller switches tabs for minutes | Should not happen — a Web Worker keeps the session heartbeating. If it does, check that `heartbeat.js` is served (DevTools → Network) and that no proxy strips it. |
 
 ## 11. Optional hardening
 
-- **Dedicated subdomain per use-case**: each vhost/clone is an independent
-  matchmaking pool — a second clone under another subdomain splits "random
-  stranger" traffic if you ever need to.
-- **SQLite WAL size**: the database self-cleans (60 s for stale clients, 1 h
-  for old messages); no cron jobs needed.
-- **Backups**: there is nothing persistent to back up by design — no accounts,
-  no history, no recordings.
+- **Recording retention**: `sessions/*.ogg` grow over time. Add a cron, e.g.
+  keep 14 days: `0 3 * * * find /var/www/html/voice/sessions -name '*.ogg' -mtime +14 -delete`.
+- **Multiple instances**: each vhost/clone is an independent room pool (give
+  each its own SFU port + `config.json`).
+- **Backups**: the only persistent artifacts are the recordings in
+  `sessions/` — include them in backups if you need history.
 - **PHP exposure**: the only PHP file is `api.php`; the frontend assets are
   static. If you want to go further, restrict `open_basedir` for this vhost to
   the project directory.

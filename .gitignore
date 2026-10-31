@@ -3,6 +3,14 @@ data/voice.db
 data/voice.db-wal
 data/voice.db-shm
 
+# generated at runtime (contains the SFU shared secret)
+config.json
+
+# SFU dependencies and recordings
+sfu/node_modules/
+sessions/*
+!sessions/.htaccess
+
 # session/workspace noise
 .zcode/
 Thumbs.db

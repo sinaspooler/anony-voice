@@ -79,10 +79,10 @@ step() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 
 # ------------------------------------------------------------ 1. packages ----
 
-step "Installing Apache, PHP, SQLite and certbot (this can take a minute)"
+step "Installing Apache, PHP, Node.js, SQLite and certbot (this can take a minute)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq apache2 libapache2-mod-php php php-sqlite3 git certbot python3-certbot-apache >/dev/null
+apt-get install -y -qq apache2 libapache2-mod-php php php-sqlite3 git certbot python3-certbot-apache nodejs npm ffmpeg >/dev/null
 
 if ! php -m | grep -qi 'pdo_sqlite'; then
     echo "WARNING: pdo_sqlite missing from PHP — voice chat will not work. Run: phpenmod sqlite3 pdo_sqlite"
@@ -105,11 +105,48 @@ fi
 
 # ----------------------------------------------- 3. writable data directory --
 
-step "Preparing the writable data directory"
+step "Preparing the writable data and sessions directories"
 # Apache on Ubuntu runs as www-data and the web root is root-owned, so the
-# SQLite database cannot create itself on first use without this.
-mkdir -p "${INSTALL_DIR}/data"
-chown -R www-data:www-data "${INSTALL_DIR}/data"
+# SQLite database and the session recordings cannot create themselves without
+# this.
+mkdir -p "${INSTALL_DIR}/data" "${INSTALL_DIR}/sessions"
+chown -R www-data:www-data "${INSTALL_DIR}/data" "${INSTALL_DIR}/sessions"
+
+# ----------------------------------------------------- 4. the Node.js SFU ----
+
+step "Installing and starting the audio forwarding service (SFU)"
+cd "${INSTALL_DIR}/sfu"
+npm ci --omit=dev >/dev/null 2>&1 || npm install --omit=dev >/dev/null
+
+cat > /etc/systemd/system/voice-sfu.service <<EOF
+[Unit]
+Description=VoiceLoop audio SFU (WebRTC forwarding + recording)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=${INSTALL_DIR}/sfu
+ExecStart=/usr/bin/node ${INSTALL_DIR}/sfu/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now voice-sfu
+for i in $(seq 1 20); do
+    if curl -sf http://127.0.0.1:3000/health >/dev/null 2>&1; then break; fi
+    sleep 0.5
+done
+if curl -sf http://127.0.0.1:3000/health >/dev/null 2>&1; then
+    echo "SFU is running on 127.0.0.1:3000 (systemd unit: voice-sfu)."
+else
+    echo "WARNING: SFU did not answer on 127.0.0.1:3000 — check: journalctl -u voice-sfu"
+fi
+cd - >/dev/null
 
 # ------------------------------------------------------------ 4. the vhost ---
 
@@ -131,8 +168,14 @@ ${SERVER_NAME_LINE}
         Require all granted
     </Directory>
 
-    # never serve the SQLite database or its WAL files
+    # never serve the SQLite database, the Node service, or raw recordings
     <Directory ${INSTALL_DIR}/data>
+        Require all denied
+    </Directory>
+    <Directory ${INSTALL_DIR}/sfu>
+        Require all denied
+    </Directory>
+    <Directory ${INSTALL_DIR}/sessions>
         Require all denied
     </Directory>
 

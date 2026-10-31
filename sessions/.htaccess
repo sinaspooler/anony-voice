@@ -1,0 +1,3 @@
+# Recordings are served only through api.php?action=session (no listing, no
+# direct URLs — filenames are unguessable but we keep the folder dark anyway).
+Require all denied

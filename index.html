@@ -4,85 +4,89 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<meta name="description" content="Talk live with a random stranger. No accounts, no names — just voices.">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'">
-<title>VoiceLoop — talk to a stranger</title>
+<meta name="description" content="Create a voice room, share the link, talk. Recorded. No accounts.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; media-src blob:">
+<title>VoiceLoop — voice rooms</title>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
 </head>
 <body>
 <main id="app">
 
-  <!-- START -->
-  <section id="screen-start" class="screen">
+  <!-- WELCOME -->
+  <section id="screen-welcome" class="screen">
     <div class="logo">🎙️</div>
     <h1>VoiceLoop</h1>
-    <p class="tagline">Talk live with a random stranger.<br>No accounts. No names. Just voices.</p>
-    <button id="btn-start" class="btn-primary">Start talking</button>
-    <p class="privacy">Peer-to-peer audio &middot; nothing is recorded &middot; the server only introduces you</p>
-    <p id="start-error" class="error hidden"></p>
+    <p class="tagline">Create a voice room, share the link, talk.<br>Nicknames only — no accounts. Rooms are recorded.</p>
+
+    <div class="field">
+      <label for="nickname">Your nickname</label>
+      <input id="nickname" maxlength="24" placeholder="e.g. midnight-owl" autocomplete="off">
+    </div>
+
+    <button id="btn-create" class="btn-primary">Create a room</button>
+
+    <div class="divider"><span>or join one</span></div>
+    <div class="join-row">
+      <input id="room-code" maxlength="20" placeholder="room code" autocomplete="off">
+      <button id="btn-join" class="btn-secondary">Join</button>
+    </div>
+    <p id="welcome-error" class="error hidden"></p>
+    <p class="privacy">Peer-to-peer audio &middot; recorded server-side &middot; nothing else is stored</p>
   </section>
 
-  <!-- WAITING -->
-  <section id="screen-waiting" class="screen hidden">
-    <div class="radar">
-      <span></span><span></span><span></span>
-      <div class="radar-core">🎙️</div>
-    </div>
-    <h2>Looking for a stranger&hellip;</h2>
-    <p class="muted">Stay here — you'll be connected the moment someone else starts.</p>
-    <button id="btn-cancel" class="btn-ghost">Cancel</button>
-  </section>
+  <!-- ROOM -->
+  <section id="screen-room" class="screen wide hidden">
+    <header class="room-head">
+      <div class="rec"><span class="rec-dot"></span><span id="rec-label">REC 00:00</span></div>
+      <div class="room-chip" id="room-chip" title="Room code">room</div>
+      <button id="btn-share" class="btn-mini" title="Copy invite link">🔗 Invite</button>
+    </header>
 
-  <!-- CALL -->
-  <section id="screen-call" class="screen hidden">
-    <div class="peers">
-      <div class="peer">
-        <div class="avatar" id="ring-local"><span class="emoji">🙂</span></div>
-        <div class="peer-name">You</div>
-      </div>
-      <div class="call-mid">
-        <div id="call-status">Connecting&hellip;</div>
-        <div class="timer" id="call-timer">00:00</div>
-      </div>
-      <div class="peer">
-        <div class="avatar remote" id="ring-remote"><span class="emoji">🎭</span></div>
-        <div class="peer-name">Stranger</div>
+    <div id="share-panel" class="share-panel hidden">
+      <label>Invite link — anyone with this link joins the room:</label>
+      <div class="join-row">
+        <input id="share-url" readonly>
+        <button id="btn-copy" class="btn-secondary">Copy</button>
       </div>
     </div>
+
+    <div id="tiles" class="tiles"></div>
+
     <div class="controls">
       <button id="btn-chat" class="btn-round" title="Text chat" aria-label="Open text chat">💬<span class="unread-dot hidden"></span></button>
       <button id="btn-mute" class="btn-round" title="Mute microphone" aria-label="Mute microphone">🎙️</button>
-      <button id="btn-end" class="btn-round danger" title="End call" aria-label="End call">📵</button>
+      <button id="btn-end" class="btn-round danger hidden" title="End room for everyone" aria-label="End room">⏹️</button>
+      <button id="btn-leave" class="btn-round danger" title="Leave room" aria-label="Leave room">📵</button>
     </div>
+    <p class="hint" id="host-hint" hidden>You are the host — ⏹️ ends the room for everyone and saves the recording.</p>
   </section>
 
   <!-- ENDED -->
   <section id="screen-ended" class="screen hidden">
     <div class="logo small">👋</div>
-    <h2 id="ended-title">Call ended</h2>
+    <h2 id="ended-title">Room closed</h2>
     <p class="muted" id="ended-sub">The call is over.</p>
-    <button id="btn-again" class="btn-primary">Find another stranger</button>
-    <button id="btn-home" class="btn-ghost">Back to start</button>
+    <p id="ended-session" class="session-link hidden"></p>
+    <button id="btn-again" class="btn-primary">Back to start</button>
   </section>
 
   <!-- TEXT CHAT -->
   <aside id="chat-panel" class="hidden" aria-label="Text chat">
     <header>
-      <span>Stranger</span>
+      <span>Room chat</span>
       <button id="btn-chat-close" aria-label="Close chat">&times;</button>
     </header>
     <div id="chat-log"></div>
     <form id="chat-form">
-      <input id="chat-input" maxlength="2000" placeholder="Type a message&hellip;" autocomplete="off">
+      <input id="chat-input" maxlength="500" placeholder="Type a message&hellip;" autocomplete="off">
       <button type="submit" aria-label="Send message">➤</button>
     </form>
   </aside>
 
 </main>
 
-<!-- remote audio: kept visually hidden but rendered so playback stays allowed -->
-<audio id="remote-audio" autoplay playsinline></audio>
+<div id="audio-sink"></div>
 
 <script src="app.js"></script>
 </body>

@@ -3,48 +3,43 @@
 /* ================= config ================= */
 
 const API = 'api.php';
-
-const RTC_CONFIG = {
-  iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-    // If both callers sit behind strict (symmetric) NATs, add a TURN server here:
-    // { urls: 'turn:turn.example.com:3478', username: 'user', credential: 'pass' },
-  ],
-};
-
-const POLL_WAIT = 600;  // queued
-const POLL_FAST = 400;  // negotiating the peer connection
-const POLL_CALL = 1000; // in a call
+const MAX_SLOTS = 15;
+const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+const POLL_ROOM = 800;
+const HEARTBEAT_MS = 3000;
 
 /* ================= state ================= */
 
-let clientId = sessionStorage.getItem('vl_client_id');
-if (!clientId) {
-  clientId = (crypto.randomUUID ? crypto.randomUUID() : 'cid-' + Date.now() + '-' + Math.random().toString(36).slice(2)).replace(/[^A-Za-z0-9_-]/g, '');
-  sessionStorage.setItem('vl_client_id', clientId);
-}
+let nickname = sessionStorage.getItem('vl_nick') || '';
+let roomId = null;
+let memberId = null;
+let memberSecret = null;
+let isHost = false;
+let joinUrl = null;
+let mySlot = -1;
 
-let phase = 'idle'; // idle | waiting | connecting | incall | ended
-let role = null; // initiator | responder
-let partnerId = null;
+let phase = 'welcome'; // welcome | room | ended
 let pc = null;
 let localStream = null;
-let remoteStream = null;
-let pendingCandidates = [];
-let lastMsgId = 0;
+let audioCtx = null;
+let micAnalyser = null;
+let micMeterData = null;
+let slotAudio = new Array(MAX_SLOTS).fill(null); // { audio, analyser, data }
+let micRaf = 0;
+
+const members = new Map(); // memberId -> {nickname, isHost, slot, speaking, isYou}
+let lastEventId = 0;
+let lastChatId = 0;
 let pollHandle = null;
 let pollBusy = false;
+
 let muted = false;
-let callTimer = null;
-let connectWatchdog = null;
-let audioCtx = null;
-let localMeter = null;
-let remoteMeter = null;
-let meterRaf = 0;
+let recording = false;
+let recStartedAt = 0;
+let recTimer = null;
+
 let chatOpen = false;
-let heartbeat = null;
-let sigSent = 0;
-let sigGot = 0;
+let heartbeatWorker = null;
 
 /* ================= elements ================= */
 
@@ -52,35 +47,54 @@ const $ = (sel) => document.querySelector(sel);
 
 const el = {
   screens: {
-    start: $('#screen-start'),
-    waiting: $('#screen-waiting'),
-    call: $('#screen-call'),
+    welcome: $('#screen-welcome'),
+    room: $('#screen-room'),
     ended: $('#screen-ended'),
   },
-  btnStart: $('#btn-start'),
-  startError: $('#start-error'),
-  btnCancel: $('#btn-cancel'),
-  callStatus: $('#call-status'),
-  timer: $('#call-timer'),
-  ringLocal: $('#ring-local'),
-  ringRemote: $('#ring-remote'),
+  nickname: $('#nickname'),
+  roomCode: $('#room-code'),
+  btnCreate: $('#btn-create'),
+  btnJoin: $('#btn-join'),
+  welcomeError: $('#welcome-error'),
+  recLabel: $('#rec-label'),
+  roomChip: $('#room-chip'),
+  btnShare: $('#btn-share'),
+  sharePanel: $('#share-panel'),
+  shareUrl: $('#share-url'),
+  btnCopy: $('#btn-copy'),
+  tiles: $('#tiles'),
   btnChat: $('#btn-chat'),
   unreadDot: $('#btn-chat .unread-dot'),
   btnMute: $('#btn-mute'),
   btnEnd: $('#btn-end'),
+  btnLeave: $('#btn-leave'),
+  hostHint: $('#host-hint'),
   endedTitle: $('#ended-title'),
   endedSub: $('#ended-sub'),
+  endedSession: $('#ended-session'),
   btnAgain: $('#btn-again'),
-  btnHome: $('#btn-home'),
   chatPanel: $('#chat-panel'),
   chatClose: $('#btn-chat-close'),
   chatLog: $('#chat-log'),
   chatForm: $('#chat-form'),
   chatInput: $('#chat-input'),
-  remoteAudio: $('#remote-audio'),
+  audioSink: $('#audio-sink'),
 };
 
-/* ================= api ================= */
+/* ================= helpers ================= */
+
+function show(name) {
+  for (const [key, node] of Object.entries(el.screens)) {
+    node.classList.toggle('hidden', key !== name);
+  }
+  phase = name;
+  if (name !== 'room') closeChat();
+}
+
+function showError(message) {
+  el.welcomeError.textContent = message;
+  el.welcomeError.classList.remove('hidden');
+}
 
 async function api(action, payload) {
   const res = await fetch(`${API}?action=${action}`, {
@@ -91,106 +105,230 @@ async function api(action, payload) {
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON error page */ }
   if (!res.ok) {
-    throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
+    const err = new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
 
 function leaveBeacon() {
-  navigator.sendBeacon(`${API}?action=leave`, new URLSearchParams({ clientId }));
+  if (!memberId) return;
+  navigator.sendBeacon(
+    `${API}?action=leave`,
+    new URLSearchParams({ memberId, memberSecret }),
+  );
 }
 
-/* ================= screens ================= */
+function fmtClock(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
 
-function show(name) {
-  for (const [key, node] of Object.entries(el.screens)) {
-    node.classList.toggle('hidden', key !== name);
+/* ================= welcome flow ================= */
+
+async function createRoom() {
+  if (!requireNickname()) return;
+  try {
+    const resp = await api('create', { nickname });
+    enterRoom(resp, true);
+  } catch (err) {
+    showError('Could not create the room: ' + err.message);
   }
 }
 
-function showError(message) {
-  el.startError.textContent = message;
-  el.startError.classList.remove('hidden');
+async function joinRoom() {
+  if (!requireNickname()) return;
+  const code = el.roomCode.value.trim().replace(/[^a-zA-Z0-9]/g, '');
+  if (!code) {
+    showError('Enter a room code or open an invite link.');
+    return;
+  }
+  try {
+    const resp = await api('join', { roomId: code, nickname });
+    enterRoom(resp, false);
+  } catch (err) {
+    const friendly = err.status === 404 ? 'That room does not exist.'
+      : err.status === 410 ? 'That room has ended.'
+      : err.status === 409 ? 'That room is full.'
+      : 'Could not join: ' + err.message;
+    showError(friendly);
+  }
 }
 
-function isActivePhase() {
-  return phase === 'waiting' || phase === 'connecting' || phase === 'incall';
+function requireNickname() {
+  nickname = el.nickname.value.trim().slice(0, 24);
+  if (!nickname) {
+    showError('Pick a nickname first.');
+    el.nickname.focus();
+    return false;
+  }
+  sessionStorage.setItem('vl_nick', nickname);
+  el.welcomeError.classList.add('hidden');
+  return true;
 }
 
-/* ================= flow: start / wait / cancel ================= */
+/* ================= room flow ================= */
 
-async function start() {
-  if (isActivePhase()) return;
-  el.startError.classList.add('hidden');
-  el.btnStart.disabled = true;
-  el.btnAgain.disabled = true;
+function enterRoom(resp, showShare) {
+  roomId = resp.roomId;
+  memberId = resp.memberId;
+  memberSecret = resp.memberSecret;
+  isHost = resp.isHost;
+  mySlot = resp.slot;
+  joinUrl = resp.joinUrl || (location.origin + location.pathname + '?room=' + roomId);
+  phase = 'room';
 
+  members.clear();
+  for (const m of resp.members || []) {
+    members.set(m.memberId, { nickname: m.nickname, isHost: m.isHost, slot: m.slot, speaking: m.speaking, isYou: m.isYou });
+  }
+  if (!resp.members) {
+    members.set(memberId, { nickname: resp.nickname, isHost: true, slot: resp.slot, speaking: false, isYou: true });
+  }
+
+  el.roomChip.textContent = 'room ' + roomId;
+  el.shareUrl.value = joinUrl;
+  el.sharePanel.classList.toggle('hidden', !showShare);
+  el.btnEnd.classList.toggle('hidden', !isHost);
+  el.hostHint.hidden = !isHost;
+  el.chatLog.innerHTML = '';
+  el.recLabel.textContent = 'REC 00:00';
+
+  show('room');
+  renderTiles();
+
+  startMedia();
+  startPolling();
+  startHeartbeat();
+}
+
+/* ---------------- media: one peer connection to the SFU ---------------- */
+
+async function startMedia() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true },
     });
   } catch {
-    el.btnStart.disabled = false;
-    el.btnAgain.disabled = false;
-    showError('Microphone access is required to voice chat. Allow the mic permission and try again.');
+    showEnded('Microphone unavailable', 'Voice chat needs microphone access. Allow the mic and try again.');
     return;
   }
 
-  try {
-    const resp = await api('join', { clientId });
-    el.btnStart.disabled = false;
-    el.btnAgain.disabled = false;
-    startHeartbeat();
-    if (resp.status === 'paired') {
-      enterSession(resp);
-    } else {
-      enterWaiting();
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  const src = audioCtx.createMediaStreamSource(localStream);
+  micAnalyser = audioCtx.createAnalyser();
+  micAnalyser.fftSize = 512;
+  src.connect(micAnalyser);
+  micMeterData = new Uint8Array(micAnalyser.fftSize);
+  startMeters();
+
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+  // m-line 0: our microphone up
+  pc.addTransceiver(localStream.getAudioTracks()[0], { direction: 'sendrecv' });
+  // m-lines 1..MAX_SLOTS: one downlink slot each (slot s lives on mid s+1)
+  for (let s = 0; s < MAX_SLOTS; s++) {
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+  }
+
+  pc.ontrack = (ev) => {
+    const mid = parseInt(ev.transceiver.mid || '0', 10);
+    const slot = mid - 1;
+    if (slot < 0 || slot >= MAX_SLOTS) return;
+    attachSlotAudio(slot, ev.streams[0]);
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (!pc) return;
+    if (pc.connectionState === 'failed') {
+      showEnded('Connection failed', 'The audio connection to the room could not be established.');
     }
-  } catch {
-    el.btnStart.disabled = false;
-    el.btnAgain.disabled = false;
-    stopMic();
-    stopHeartbeat();
-    showError('Could not reach the server. Is Apache running?');
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  try {
+    await waitGatherComplete(pc);
+    const resp = await api('media_attach', { memberId, memberSecret, offerSdp: pc.localDescription.sdp });
+    await pc.setRemoteDescription({ type: 'answer', sdp: resp.answerSdp });
+    startRecTimer();
+  } catch (err) {
+    if (phase === 'room') {
+      showEnded('Media service unavailable', err.status === 503
+        ? 'The audio server is not running. Ask the host to start it (node sfu/server.js).'
+        : err.message);
+    }
   }
 }
 
-function enterWaiting() {
-  phase = 'waiting';
-  show('waiting');
-  startPolling();
+function waitGatherComplete(pc) {
+  return new Promise((resolve) => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const timer = setTimeout(resolve, 2000); // bounded: some candidates beat none
+    const handler = () => {
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(timer);
+        pc.removeEventListener('icegatheringstatechange', handler);
+        resolve();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', handler);
+  });
 }
 
-function cancelWaiting() {
-  leaveBeacon();
-  phase = 'idle';
-  stopPolling();
-  stopHeartbeat();
-  stopMic();
-  show('start');
+function attachSlotAudio(slot, stream) {
+  if (slotAudio[slot]) return; // one binding per slot
+  const audio = document.createElement('audio');
+  audio.autoplay = true;
+  audio.srcObject = stream;
+  audio.play().catch(() => { /* autoplay guard */ });
+  el.audioSink.appendChild(audio);
+
+  let analyser = null;
+  let data = null;
+  if (audioCtx) {
+    const src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    data = new Uint8Array(analyser.fftSize);
+  }
+  slotAudio[slot] = { audio, analyser, data };
 }
 
-/* ================= polling ================= */
+/* ---------------- polling loop ---------------- */
 
 function startPolling() {
   if (pollHandle !== null) return;
   const tick = async () => {
     if (pollHandle === null) return;
-    if (!pollBusy) {
+    if (!pollBusy && memberId) {
       pollBusy = true;
       try {
-        const res = await fetch(`${API}?action=poll&clientId=${encodeURIComponent(clientId)}&since=${lastMsgId}`);
-        const resp = await res.json();
-        if (pollHandle !== null) applyPoll(resp);
-      } catch {
-        // transient hiccup — retry on the next tick
+        const resp = await api('poll', {
+          memberId,
+          memberSecret,
+          since: lastEventId,
+          sinceChat: lastChatId,
+          speaking: levelOf({ analyser: micAnalyser, data: micMeterData }) > 0.06 && !muted,
+        });
+        applyPoll(resp);
+      } catch (err) {
+        if (err.status === 403) {
+          // credentials rejected: room was torn down server-side
+          stopPolling();
+          showEnded('Room closed', 'Your session is no longer registered with the server.');
+          return;
+        }
+        // transient network hiccup — retry next tick
       }
       pollBusy = false;
     }
-    if (pollHandle !== null) {
-      const delay = phase === 'connecting' ? POLL_FAST : phase === 'incall' ? POLL_CALL : POLL_WAIT;
-      pollHandle = setTimeout(tick, delay);
-    }
+    if (pollHandle !== null) pollHandle = setTimeout(tick, POLL_ROOM);
   };
   pollHandle = setTimeout(tick, 0);
 }
@@ -204,262 +342,96 @@ function stopPolling() {
 }
 
 function applyPoll(resp) {
-  if (resp.status === 'ended') {
-    endCall(resp.reason === 'partner_left' ? 'Stranger left' : 'Call ended',
-      resp.reason === 'partner_left' ? 'Your partner ended the call or closed the tab.' : '');
-    return;
-  }
-  if (resp.status === 'idle') {
-    if (isActivePhase()) {
-      endCall('Disconnected', 'Lost contact with the server.');
+  if (resp.status === 'closed') {
+    stopPolling();
+    stopHeartbeat();
+    // the sessions row is written moments after the room is closed; if it is
+    // not there yet, look for it briefly before giving up on the link
+    if (resp.sessionFile) {
+      showEnded('Room ended', 'The recording has been saved.', resp.sessionFile);
+    } else {
+      showEnded('Room ended', 'The recording is being saved.');
+      offerSessionWhenReady(3);
     }
     return;
   }
-  if (resp.status === 'paired') {
-    if (phase === 'waiting') {
-      enterSession(resp); // creates the peer connection before any queued messages are handled
-    }
-    if (phase !== 'connecting' && phase !== 'incall') return;
-    for (const m of resp.messages || []) {
-      lastMsgId = Math.max(lastMsgId, m.id);
-      if (m.kind === 'signal') {
-        try { handleSignal(JSON.parse(m.payload)); } catch { /* malformed signal */ }
-      } else if (m.kind === 'chat') {
-        addChatMessage('stranger', m.payload);
-      }
+
+  if (resp.recording && !recording) {
+    recording = true;
+    if (!recStartedAt) {
+      recStartedAt = Date.now();
+      startRecTimer();
     }
   }
-  // status 'waiting' while queued: nothing to do
-}
 
-/* ================= webRTC session ================= */
-
-function enterSession(resp) {
-  phase = 'connecting';
-  role = resp.role;
-  partnerId = resp.partnerId;
-  sigSent = 0;
-  sigGot = 0;
-  show('call');
-  setCallStatus('Connecting…');
-  el.timer.textContent = '00:00';
-  el.chatLog.innerHTML = '';
-  addChatPlaceholder();
-  createPeerConnection();
-  startMeters();
-  // ICE gets its full native failure timeline (~30s); the watchdog below is
-  // only a backstop for the case where connection state never resolves
-  connectWatchdog = setTimeout(() => {
-    if (phase === 'connecting') {
-      endCall('Connection failed', 'Could not establish a direct audio connection — the other side may have vanished, or a strict firewall/NAT is blocking peer-to-peer traffic.');
+  // membership: rebuild the map, then reconcile tiles
+  const seen = new Set();
+  for (const m of resp.members || []) {
+    seen.add(m.memberId);
+    const known = members.get(m.memberId);
+    if (known) {
+      known.speaking = m.speaking;
+      known.nickname = m.nickname;
+    } else {
+      members.set(m.memberId, { nickname: m.nickname, isHost: m.isHost, slot: m.slot, speaking: m.speaking, isYou: m.isYou });
     }
-  }, 30000);
-  if (role === 'initiator') {
-    makeOffer();
   }
-  // the initiator learns of the pairing from its join response and has no
-  // polling loop yet — the responder arrives here from applyPoll, where the
-  // loop is already running (startPolling is a no-op then)
-  startPolling();
-}
-
-function createPeerConnection() {
-  pc = new RTCPeerConnection(RTC_CONFIG);
-  pendingCandidates = [];
-
-  for (const track of localStream.getAudioTracks()) {
-    pc.addTrack(track, localStream);
+  for (const id of [...members.keys()]) {
+    if (!seen.has(id)) members.delete(id);
   }
+  renderTiles();
 
-  pc.ontrack = (ev) => {
-    remoteStream = ev.streams[0];
-    el.remoteAudio.srcObject = remoteStream;
-    el.remoteAudio.play().catch(() => { /* autoplay guard */ });
-    attachRemoteMeter(remoteStream);
-  };
-
-  pc.onicecandidate = (ev) => {
-    if (ev.candidate) {
-      sendSignal({ type: 'candidate', candidate: ev.candidate.toJSON() });
+  for (const ev of resp.events || []) {
+    lastEventId = Math.max(lastEventId, ev.id);
+    if (ev.type === 'member_joined' && ev.payload) {
+      addSystemLine(`${ev.payload.nickname} joined the room`);
+    } else if (ev.type === 'member_left' && ev.payload) {
+      addSystemLine(`${ev.payload.nickname} left the room`);
+    } else if (ev.type === 'room_closed') {
+      // poll flips to status closed on the next response
     }
-  };
+  }
 
-  pc.onconnectionstatechange = () => {
-    if (!pc) return;
-    if (pc.connectionState === 'connected') {
-      onConnected();
-    } else if (pc.connectionState === 'failed') {
-      endCall('Connection failed', 'The peer connection could not be established — a strict firewall or NAT may be blocking peer-to-peer audio.');
-    } else if (pc.connectionState === 'disconnected') {
-      setCallStatus('Reconnecting…');
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    if (pc && pc.iceConnectionState === 'failed') {
-      endCall('Connection failed', 'The peer connection could not be established — a strict firewall or NAT may be blocking peer-to-peer audio.');
-    }
-  };
-}
-
-async function makeOffer() {
-  try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await sendSignal({ type: 'offer', sdp: pc.localDescription.sdp });
-  } catch (err) {
-    console.error('offer failed', err);
+  for (const c of resp.chats || []) {
+    lastChatId = Math.max(lastChatId, c.id);
+    addChatMessage(c.memberId === memberId ? 'me' : 'stranger', `${c.nickname}: ${c.text}`);
   }
 }
 
-async function handleSignal(sig) {
-  if (!sig || typeof sig !== 'object') return;
-  sigGot++;
-  try {
-    if (sig.type === 'offer' || sig.type === 'answer') {
-      if (!pc) return;
-      await pc.setRemoteDescription({ type: sig.type, sdp: sig.sdp });
-      const queued = pendingCandidates;
-      pendingCandidates = [];
-      for (const c of queued) {
-        try { await pc.addIceCandidate(c); } catch { /* stale candidate */ }
-      }
-      if (sig.type === 'offer') {
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        await sendSignal({ type: 'answer', sdp: pc.localDescription.sdp });
-      }
-    } else if (sig.type === 'candidate' && sig.candidate) {
-      if (pc && pc.remoteDescription) {
-        try { await pc.addIceCandidate(sig.candidate); } catch { /* stale candidate */ }
-      } else {
-        pendingCandidates.push(sig.candidate);
-      }
-    }
-  } catch (err) {
-    console.error('signal error', err);
+/* ---------------- tiles (participants + speaking glow) ---------------- */
+
+function renderTiles() {
+  const ids = [...members.keys()];
+  // rebuild only when membership changed
+  const signature = ids.map((id) => id + ':' + members.get(id).slot).join('|');
+  if (el.tiles.dataset.sig === signature) return;
+  el.tiles.dataset.sig = signature;
+  el.tiles.innerHTML = '';
+
+  for (const id of ids) {
+    const m = members.get(id);
+    const tile = document.createElement('div');
+    tile.className = 'tile';
+    tile.dataset.member = id;
+    tile.dataset.slot = String(m.slot);
+
+    const avatar = document.createElement('div');
+    avatar.className = 'tile-avatar' + (m.isYou ? ' you' : '');
+    avatar.textContent = (m.nickname || '?').charAt(0).toUpperCase();
+
+    const name = document.createElement('div');
+    name.className = 'tile-name';
+    name.textContent = m.nickname + (m.isHost ? ' 👑' : '') + (m.isYou ? ' (you)' : '');
+
+    tile.appendChild(avatar);
+    tile.appendChild(name);
+    el.tiles.appendChild(tile);
   }
-}
-
-function sendSignal(data) {
-  sigSent++;
-  return api('signal', { clientId, data: JSON.stringify(data) })
-    .catch((err) => console.error('signal send failed', err));
-}
-
-function onConnected() {
-  if (phase !== 'connecting') return;
-  phase = 'incall';
-  if (connectWatchdog) {
-    clearTimeout(connectWatchdog);
-    connectWatchdog = null;
-  }
-  setCallStatus('Connected — say hi!');
-  startCallTimer();
-}
-
-function setCallStatus(text) {
-  el.callStatus.textContent = text;
-}
-
-function startCallTimer() {
-  const startedAt = Date.now();
-  el.timer.textContent = '00:00';
-  callTimer = setInterval(() => {
-    const s = Math.floor((Date.now() - startedAt) / 1000);
-    el.timer.textContent =
-      String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
-  }, 500);
-}
-
-function stopCallTimer() {
-  if (callTimer) {
-    clearInterval(callTimer);
-    callTimer = null;
-  }
-}
-
-/* ================= teardown ================= */
-
-function endCall(title, subtitle) {
-  if (phase === 'ended') return;
-  phase = 'ended';
-  stopPolling();
-  stopHeartbeat();
-  teardownRTC();
-  el.endedTitle.textContent = title;
-  el.endedSub.textContent = subtitle || 'The call is over.';
-  show('ended');
-}
-
-function teardownRTC() {
-  stopMeters();
-  stopCallTimer();
-  if (connectWatchdog) {
-    clearTimeout(connectWatchdog);
-    connectWatchdog = null;
-  }
-  if (pc) {
-    pc.onicecandidate = null;
-    pc.ontrack = null;
-    pc.onconnectionstatechange = null;
-    try { pc.close(); } catch { /* already closed */ }
-    pc = null;
-  }
-  el.remoteAudio.srcObject = null;
-  remoteStream = null;
-  role = null;
-  partnerId = null;
-  lastMsgId = 0;
-  pendingCandidates = [];
-  closeChat();
-  el.chatLog.innerHTML = '';
-  el.unreadDot.classList.add('hidden');
-  stopMic();
-}
-
-function stopMic() {
-  if (localStream) {
-    for (const t of localStream.getTracks()) t.stop();
-    localStream = null;
-  }
-  if (audioCtx) {
-    audioCtx.close().catch(() => { /* already closed */ });
-    audioCtx = null;
-  }
-  localMeter = null;
-  remoteMeter = null;
-  if (muted) {
-    muted = false;
-    updateMuteButton();
-  }
-}
-
-/* ================= mic-level meters ================= */
-
-function startMeters() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(localStream);
-    const analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 512;
-    src.connect(analyser);
-    localMeter = { analyser, data: new Uint8Array(analyser.fftSize) };
-  }
-  if (!meterRaf) meterRaf = requestAnimationFrame(meterLoop);
-}
-
-function attachRemoteMeter(stream) {
-  if (!audioCtx) return;
-  const src = audioCtx.createMediaStreamSource(stream);
-  const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 512;
-  src.connect(analyser);
-  remoteMeter = { analyser, data: new Uint8Array(analyser.fftSize) };
+  paintLevels(); // reset glows for the new tiles
 }
 
 function levelOf(meter) {
-  if (!meter) return 0;
+  if (!meter || !meter.analyser) return 0;
   meter.analyser.getByteTimeDomainData(meter.data);
   let sum = 0;
   for (let i = 0; i < meter.data.length; i++) {
@@ -469,43 +441,150 @@ function levelOf(meter) {
   return Math.min(1, Math.sqrt(sum / meter.data.length) * 4);
 }
 
-function meterLoop() {
-  meterRaf = requestAnimationFrame(meterLoop);
-  paintRing(el.ringLocal, muted ? 0 : levelOf(localMeter));
-  paintRing(el.ringRemote, levelOf(remoteMeter));
+function paintLevels() {
+  if (phase !== 'room') return;
+
+  // server-reported speaking flags are the authoritative cross-device signal
+  // (polled ~1s); local analysers add a fast, real-time shimmer on top
+  const remoteSpeaking = new Set();
+  let selfSpeaking = false;
+  for (const m of members.values()) {
+    if (m.speaking) (m.isYou ? selfSpeaking = true : remoteSpeaking.add(m.slot));
+  }
+
+  const localTile = el.tiles.querySelector('.tile-avatar.you');
+  if (localTile) {
+    const lvl = muted ? 0 : Math.max(levelOf({ analyser: micAnalyser, data: micMeterData }), selfSpeaking ? 0.85 : 0);
+    paintRing(localTile, lvl);
+  }
+  for (let s = 0; s < MAX_SLOTS; s++) {
+    const tile = el.tiles.querySelector(`.tile[data-slot="${s}"] .tile-avatar`);
+    if (!tile) continue;
+    const meter = slotAudio[s];
+    const lvl = Math.max(levelOf(meter), remoteSpeaking.has(s) ? 0.85 : 0);
+    paintRing(tile, lvl);
+  }
+  micRaf = requestAnimationFrame(paintLevels);
 }
 
 function paintRing(node, level) {
   node.style.boxShadow =
-    `0 0 ${(6 + level * 30).toFixed(1)}px ${(level * 7).toFixed(1)}px ` +
-    `rgba(56, 224, 198, ${(0.15 + level * 0.8).toFixed(2)})`;
+    `0 0 ${(6 + level * 26).toFixed(1)}px ${(level * 6).toFixed(1)}px ` +
+    `rgba(56, 224, 198, ${(0.12 + level * 0.8).toFixed(2)})`;
+}
+
+function startMeters() {
+  if (!micRaf) micRaf = requestAnimationFrame(paintLevels);
 }
 
 function stopMeters() {
-  if (meterRaf) {
-    cancelAnimationFrame(meterRaf);
-    meterRaf = 0;
+  if (micRaf) {
+    cancelAnimationFrame(micRaf);
+    micRaf = 0;
   }
-  paintRing(el.ringLocal, 0);
-  paintRing(el.ringRemote, 0);
 }
 
-/* ================= mute ================= */
+/* ---------------- recording indicator ---------------- */
+
+function startRecTimer() {
+  if (recTimer) return;
+  if (!recStartedAt) recStartedAt = Date.now();
+  recTimer = setInterval(() => {
+    el.recLabel.textContent = 'REC ' + fmtClock((Date.now() - recStartedAt) / 1000);
+  }, 500);
+  el.recLabel.parentElement.classList.add('active');
+}
+
+/* ---------------- mute ---------------- */
 
 function toggleMute() {
   if (!localStream) return;
   muted = !muted;
   for (const t of localStream.getAudioTracks()) t.enabled = !muted;
-  updateMuteButton();
-}
-
-function updateMuteButton() {
   el.btnMute.textContent = muted ? '🔇' : '🎙️';
   el.btnMute.classList.toggle('active', muted);
   el.btnMute.title = muted ? 'Unmute microphone' : 'Mute microphone';
 }
 
-/* ================= text chat ================= */
+/* ---------------- teardown ---------------- */
+
+function teardownMedia() {
+  stopMeters();
+  if (pc) {
+    pc.ontrack = null;
+    pc.onconnectionstatechange = null;
+    try { pc.close(); } catch { /* already closed */ }
+    pc = null;
+  }
+  for (const sink of [...el.audioSink.children]) sink.remove();
+  slotAudio = new Array(MAX_SLOTS).fill(null);
+  if (localStream) {
+    for (const t of localStream.getTracks()) t.stop();
+    localStream = null;
+  }
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+  }
+  micAnalyser = null;
+  if (recTimer) {
+    clearInterval(recTimer);
+    recTimer = null;
+  }
+  recording = false;
+  recStartedAt = 0;
+  members.clear();
+  el.tiles.innerHTML = '';
+  el.tiles.dataset.sig = '';
+  if (muted) {
+    muted = false;
+    el.btnMute.textContent = '🎙️';
+    el.btnMute.classList.remove('active');
+  }
+}
+
+function showEnded(title, subtitle, sessionFile) {
+  if (phase === 'ended') return;
+  phase = 'ended';
+  stopPolling();
+  stopHeartbeat();
+  teardownMedia();
+  el.endedTitle.textContent = title;
+  el.endedSub.textContent = subtitle || 'The call is over.';
+  el.endedSession.classList.add('hidden');
+  el.endedSession.innerHTML = '';
+  if (sessionFile) offerSessionLink(sessionFile);
+  show('ended');
+}
+
+/** Render (or refresh) the recording download link on the ended screen. */
+function offerSessionLink(sessionFile) {
+  el.endedSession.innerHTML = '';
+  const a = document.createElement('a');
+  a.href = `${API}?action=session&file=${encodeURIComponent(sessionFile)}`;
+  a.textContent = '⬇ Download the room recording';
+  a.download = sessionFile;
+  el.endedSession.appendChild(a);
+  el.endedSession.classList.remove('hidden');
+}
+
+/** After a room closes, poll the sessions list for the finished mix. */
+async function offerSessionWhenReady(attempts) {
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, 2500));
+    try {
+      const list = await fetch(`${API}?action=sessions`).then((r) => r.json());
+      const mine = (list.sessions || []).find((s) => s.roomId === roomId);
+      if (mine) {
+        offerSessionLink(mine.file);
+        return true;
+      }
+    } catch { /* retry */ }
+  }
+  return false;
+}
+
+/* ---------------- text chat ---------------- */
 
 function toggleChat(force) {
   const open = force !== undefined ? force : !chatOpen;
@@ -513,131 +592,144 @@ function toggleChat(force) {
   chatOpen = open;
   el.chatPanel.classList.toggle('hidden', !chatOpen);
   el.unreadDot.classList.add('hidden');
-  if (chatOpen) {
-    el.chatInput.focus();
-    el.chatLog.scrollTop = el.chatLog.scrollHeight;
-  }
-}
-
-function closeChat() {
-  toggleChat(false);
-}
-
-function addChatPlaceholder() {
-  const div = document.createElement('div');
-  div.className = 'empty';
-  div.textContent = 'You can also type here if the audio is unclear.';
-  el.chatLog.appendChild(div);
+  if (chatOpen) el.chatInput.focus();
 }
 
 function addChatMessage(who, text) {
-  const empty = el.chatLog.querySelector('.empty');
-  if (empty) empty.remove();
   const div = document.createElement('div');
   div.className = 'msg ' + who;
-  div.textContent = text; // textContent keeps stranger input inert
+  div.textContent = text;
   el.chatLog.appendChild(div);
   el.chatLog.scrollTop = el.chatLog.scrollHeight;
-  if (who === 'stranger' && !chatOpen) {
-    el.unreadDot.classList.remove('hidden');
-  }
+  if (who === 'stranger' && !chatOpen) el.unreadDot.classList.remove('hidden');
+}
+
+function addSystemLine(text) {
+  const div = document.createElement('div');
+  div.className = 'msg system';
+  div.textContent = text;
+  el.chatLog.appendChild(div);
+  el.chatLog.scrollTop = el.chatLog.scrollHeight;
 }
 
 async function sendChat() {
   const text = el.chatInput.value.trim();
-  if (!text || (phase !== 'connecting' && phase !== 'incall')) return;
+  if (!text || phase !== 'room') return;
   el.chatInput.value = '';
-  addChatMessage('me', text);
+  addChatMessage('me', `${nickname}: ${text}`);
   try {
-    await api('chat', { clientId, text });
+    await api('chat', { memberId, memberSecret, text });
   } catch {
-    addChatMessage('stranger', '⚠ (message not delivered — call may have ended)');
+    addChatMessage('stranger', '⚠ (message not delivered)');
   }
 }
 
-/* ================= heartbeat (survives background-tab timer throttling) ================= */
+/* ---------------- heartbeat (background-tab keep-alive) ---------------- */
 
 function startHeartbeat() {
   try {
-    if (!heartbeat) {
-      // same-origin file: blob: workers would be blocked by the site CSP
-      heartbeat = new Worker('heartbeat.js');
+    if (!heartbeatWorker) {
+      heartbeatWorker = new Worker('heartbeat.js');
     }
-    heartbeat.postMessage({ cmd: 'start', clientId });
+    heartbeatWorker.postMessage({
+      cmd: 'start',
+      apiUrl: new URL(API, location.href).href,
+      memberId,
+      memberSecret,
+      interval: HEARTBEAT_MS,
+    });
   } catch {
-    heartbeat = null; // workers unavailable — polling still doubles as a heartbeat
+    heartbeatWorker = null; // workers unavailable — polling doubles as the heartbeat
   }
 }
 
 function stopHeartbeat() {
-  if (heartbeat) {
-    heartbeat.postMessage({ cmd: 'stop' });
-  }
+  try {
+    if (heartbeatWorker) heartbeatWorker.postMessage({ cmd: 'stop' });
+  } catch { /* noop */ }
 }
 
-/* ================= wiring ================= */
+/* ---------------- wiring ---------------- */
 
-el.btnStart.addEventListener('click', start);
-el.btnAgain.addEventListener('click', start);
-el.btnHome.addEventListener('click', () => {
-  phase = 'idle';
-  show('start');
+el.btnCreate.addEventListener('click', createRoom);
+el.btnJoin.addEventListener('click', joinRoom);
+el.roomCode.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinRoom(); });
+el.nickname.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    if (el.roomCode.value) joinRoom();
+    else createRoom();
+  }
 });
-el.btnCancel.addEventListener('click', cancelWaiting);
-el.btnEnd.addEventListener('click', () => {
-  leaveBeacon();
-  endCall('You ended the call');
+el.btnAgain.addEventListener('click', () => {
+  memberId = null;
+  roomId = null;
+  show('welcome');
+});
+el.btnShare.addEventListener('click', () => {
+  el.sharePanel.classList.toggle('hidden');
+});
+el.btnCopy.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(joinUrl);
+    el.btnCopy.textContent = 'Copied!';
+    setTimeout(() => { el.btnCopy.textContent = 'Copy'; }, 1500);
+  } catch {
+    el.shareUrl.select();
+    document.execCommand('copy');
+  }
 });
 el.btnMute.addEventListener('click', toggleMute);
 el.btnChat.addEventListener('click', () => toggleChat());
-el.chatClose.addEventListener('click', closeChat);
+el.chatClose.addEventListener('click', () => toggleChat(false));
 el.chatForm.addEventListener('submit', (e) => {
   e.preventDefault();
   sendChat();
 });
+el.btnLeave.addEventListener('click', () => {
+  leaveBeacon();
+  showEnded('You left the room', 'Thanks for talking!');
+});
+el.btnEnd.addEventListener('click', async () => {
+  try {
+    const resp = await api('end_room', { memberId, memberSecret });
+    if (resp.session) {
+      // the ended screen may already be visible via the poll's closed status —
+      // refresh its download link either way
+      offerSessionLink(resp.session.file);
+      el.endedTitle.textContent = 'Room ended';
+      el.endedSub.textContent = 'The recording has been saved.';
+    }
+  } catch {
+    // the poll's closed path handles the screen; finalize continues server-side
+  }
+});
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && chatOpen) closeChat();
+  if (e.key === 'Escape' && chatOpen) toggleChat(false);
 });
-
-// pagehide covers tab close, refresh and mobile backgrounding
 window.addEventListener('pagehide', () => {
-  if (isActivePhase()) leaveBeacon();
+  if (phase === 'room') leaveBeacon();
 });
-
-// when a suspended/backgrounded tab wakes back up, poll immediately instead
-// of waiting out the throttled timer — it may learn the call ended, or resume
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && isActivePhase()) {
-    stopPolling();
+  if (!document.hidden && phase === 'room' && pollHandle === null && memberId) {
     startPolling();
   }
-});
-
-// small debug hook for diagnosing call state from the console
-window.__vl = () => ({
-  phase, role, partnerId, lastMsgId, muted, chatOpen,
-  sigSent, sigGot, candidatesQueued: pendingCandidates.length,
-  pc: pc ? { conn: pc.connectionState, ice: pc.iceConnectionState } : null,
-});
-
-// ICE diagnostics: candidate-pair and local-candidate summary (console use)
-window.__vlStats = async () => {
-  if (!pc) return null;
-  const report = await pc.getStats();
-  const pairs = [];
-  const locals = {};
-  const remotes = {};
-  for (const r of report.values()) {
-    if (r.type === 'candidate-pair') {
-      pairs.push({ state: r.state, nominated: r.nominated, local: r.localCandidateId, remote: r.remoteCandidateId, prio: r.priority });
-    } else if (r.type === 'local-candidate') {
-      locals[r.id] = `${r.candidateType} ${r.address || r.ip} ${r.port} ${r.protocol}`;
-    } else if (r.type === 'remote-candidate') {
-      remotes[r.id] = `${r.candidateType} ${r.address || r.ip} ${r.port} ${r.protocol}`;
-    }
+  // a room that ended while this tab was in the background may have a
+  // finished recording by now — check once on return
+  if (!document.hidden && phase === 'ended' && roomId
+      && document.querySelector('#ended-session').classList.contains('hidden')) {
+    offerSessionWhenReady(1);
   }
-  return pairs
-    .sort((a, b) => b.prio - a.prio)
-    .slice(0, 6)
-    .map((p) => ({ state: p.state, nominated: p.nominated, local: locals[p.local], remote: remotes[p.remote] }));
-};
+});
+
+/* ---------------- boot ---------------- */
+
+(function boot() {
+  if (nickname) el.nickname.value = nickname;
+  const params = new URLSearchParams(location.search);
+  const room = params.get('room');
+  if (room) {
+    el.roomCode.value = room.replace(/[^a-zA-Z0-9]/g, '');
+    el.roomCode.disabled = true;
+  }
+  el.nickname.focus();
+})();
