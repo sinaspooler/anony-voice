@@ -29,6 +29,9 @@ a full **server-side recording** of every session saved as `.ogg`.
 4. When the host ends the room, the mixed recording appears in `sessions/`
    (needs `ffmpeg` on PATH; otherwise per-member parts are kept).
 
+**Full Windows walkthrough**: [WINDOWS.md](WINDOWS.md) — prerequisites,
+step-by-step setup, and troubleshooting for testing locally on Windows.
+
 `config.json` is generated on first run with a random SFU secret shared by
 `api.php` and the SFU. Delete it to rotate.
 
